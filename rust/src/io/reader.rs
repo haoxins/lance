@@ -31,6 +31,7 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::concat::{concat, concat_batches};
 use async_recursion::async_recursion;
 use byteorder::{ByteOrder, LittleEndian};
+use bytes::{BufMut, BytesMut};
 use futures::stream::{self, TryStreamExt};
 use futures::StreamExt;
 use object_store::path::Path;
@@ -55,11 +56,33 @@ use super::object_store::ObjectStore;
 pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Manifest> {
     let file_size = object_store.inner.head(path).await?.size;
     const PREFETCH_SIZE: usize = 64 * 1024;
-    let range = Range {
-        start: std::cmp::max(file_size as i64 - PREFETCH_SIZE as i64, 0) as usize,
-        end: file_size,
+
+    let buf = if file_size <= PREFETCH_SIZE {
+        let range = Range {
+            start: 0,
+            end: file_size,
+        };
+        object_store.inner.get_range(path, range).await?
+    } else {
+        let range_start = Range {
+            start: 0,
+            end: PREFETCH_SIZE - 16,
+        };
+        let range_end = Range {
+            start: file_size - 16,
+            end: file_size,
+        };
+
+        let bufs = object_store
+            .inner
+            .get_ranges(path, &[range_start, range_end])
+            .await?;
+        let mut buf = BytesMut::with_capacity(1024);
+        buf.put(bufs[0].clone());
+        buf.put(bufs[1].clone());
+        buf.freeze()
     };
-    let buf = object_store.inner.get_range(path, range).await?;
+
     if buf.len() < 16 {
         return Err(Error::IO(
             "Invalid format: file size is smaller than 16 bytes".to_string(),
